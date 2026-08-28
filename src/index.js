@@ -665,6 +665,7 @@ async function getSmsRecipients(env, groupId) {
           secret: env.RECIPIENTS_API_SECRET,
           groupId: groupId,
         }),
+        });
 
       if (!response.ok) {
         throw new Error(
