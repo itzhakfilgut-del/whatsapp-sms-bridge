@@ -5,7 +5,7 @@ Cloudflare Worker שמקבל Webhooks מ־GREEN-API ושולח הודעות What
 ## מה הקוד עושה
 
 - מקבל Webhook ב־`POST /webhooks/green-api`.
-- מטפל רק בהודעות WhatsApp נכנסות מקבוצות.
+- מטפל אך ורק בהודעות WhatsApp נכנסות מקבוצות.
 - שולח ב־SMS רק הודעות שמתחילות ב־`**`.
 - מסיר את שתי הכוכביות לפני השליחה.
 - מונע שליחה כפולה באמצעות Cloudflare KV למשך 7 ימים.
