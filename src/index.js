@@ -170,8 +170,8 @@ stateInstance === "yellowCard"
 
 try {
 const smsResult = await sendAdminAlertSms(
-alertMessage,
-env
+  alertMessage,
+  env,
 );
 
 await env.MESSAGE_DEDUPE.put(
@@ -343,7 +343,8 @@ smsText: cleanSmsText,
 try {
 const smsResult = await sendSms4Free(
 cleanSmsText,
-env
+env,
+chatId
 );
 
 await env.MESSAGE_DEDUPE.put(
@@ -414,13 +415,12 @@ error instanceof Error
 * 0521234567
 * 0531234567
 */
-async function sendSms4Free(message, env) {
+async function sendSms4Free(message, env, chatId) {
 const requiredSecrets = [
 "SMS4FREE_KEY",
 "SMS4FREE_USER",
 "SMS4FREE_PASS",
 "SMS4FREE_SENDER",
-"SMS_RECIPIENTS",
 ];
 
 for (const secretName of requiredSecrets) {
@@ -441,12 +441,16 @@ throw new Error(
 *
 * Set מסיר מספרים כפולים.
 */
-const recipients = await getSmsRecipients(env);
+const recipients = await getSmsRecipients(env, chatId);
 
 if (recipients.length === 0) {
-throw new Error(
-"No valid SMS recipients"
-);
+  return {
+    status: 1,
+    message: "No recipients for this group",
+    totalRecipients: 0,
+    batchCount: 0,
+    batches: [],
+  };
 }
 
 /*
@@ -516,7 +520,7 @@ env,
 batchNumber,
 }) {
 const response = await fetch(
-"[https://api.sms4free.co.il/ApiSMS/v2/SendSMS](https://api.sms4free.co.il/ApiSMS/v2/SendSMS)",
+"https://api.sms4free.co.il/ApiSMS/v2/SendSMS",
 {
 method: "POST",
 headers: {
@@ -601,7 +605,7 @@ throw new Error(
 }
 
 const response = await fetch(
-"[https://api.sms4free.co.il/ApiSMS/v2/SendSMS](https://api.sms4free.co.il/ApiSMS/v2/SendSMS)",
+"https://api.sms4free.co.il/ApiSMS/v2/SendSMS",
 {
 method: "POST",
 headers: {
@@ -648,7 +652,7 @@ smsResult: result,
 return result;
 }
 
-async function getSmsRecipients(env) {
+async function getSmsRecipients(env, groupId) {
   // אם הוגדר Google Sheets API — מנסים לקרוא ממנו
   if (env.RECIPIENTS_API_URL && env.RECIPIENTS_API_SECRET) {
     try {
@@ -659,8 +663,8 @@ async function getSmsRecipients(env) {
         },
         body: JSON.stringify({
           secret: env.RECIPIENTS_API_SECRET,
+          groupId: groupId,
         }),
-      });
 
       if (!response.ok) {
         throw new Error(
@@ -682,17 +686,13 @@ async function getSmsRecipients(env) {
           ),
         ];
 
-        if (recipients.length > 0) {
-          console.log(
-            "RECIPIENTS LOADED FROM GOOGLE SHEETS:",
-            recipients.length
-          );
+        console.log(
+          "RECIPIENTS LOADED FROM GOOGLE SHEETS:",
+          recipients.length
+        );
 
-          return recipients;
-        }
+        return recipients;
       }
-
-      throw new Error("No valid recipients returned");
     } catch (error) {
       console.error(
         "GOOGLE SHEETS RECIPIENTS FAILED:",
