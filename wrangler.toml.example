@@ -1,0 +1,7 @@
+name = "whatsapp-sms-bridge"
+main = "src/index.js"
+compatibility_date = "2026-08-28"
+
+[[kv_namespaces]]
+binding = "MESSAGE_DEDUPE"
+id = "PUT_YOUR_KV_NAMESPACE_ID_HERE"
