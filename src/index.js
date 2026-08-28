@@ -441,14 +441,7 @@ throw new Error(
 *
 * Set מסיר מספרים כפולים.
 */
-const recipients = [
-...new Set(
-String(env.SMS_RECIPIENTS)
-.split(/[,;\n\r]+/)
-.map(normalizePhoneNumber)
-.filter(Boolean)
-),
-];
+const recipients = await getSmsRecipients(env);
 
 if (recipients.length === 0) {
 throw new Error(
@@ -653,6 +646,83 @@ smsResult: result,
 }
 
 return result;
+}
+
+async function getSmsRecipients(env) {
+  // אם הוגדר Google Sheets API — מנסים לקרוא ממנו
+  if (env.RECIPIENTS_API_URL && env.RECIPIENTS_API_SECRET) {
+    try {
+      const response = await fetch(env.RECIPIENTS_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          secret: env.RECIPIENTS_API_SECRET,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `Recipients API returned HTTP ${response.status}`
+        );
+      }
+
+      const data = await response.json();
+
+      if (
+        data?.ok === true &&
+        Array.isArray(data.recipients)
+      ) {
+        const recipients = [
+          ...new Set(
+            data.recipients
+              .map(normalizePhoneNumber)
+              .filter(Boolean)
+          ),
+        ];
+
+        if (recipients.length > 0) {
+          console.log(
+            "RECIPIENTS LOADED FROM GOOGLE SHEETS:",
+            recipients.length
+          );
+
+          return recipients;
+        }
+      }
+
+      throw new Error("No valid recipients returned");
+    } catch (error) {
+      console.error(
+        "GOOGLE SHEETS RECIPIENTS FAILED:",
+        error instanceof Error
+          ? error.message
+          : String(error)
+      );
+    }
+  }
+
+  /*
+   * גיבוי:
+   * אם Google Sheets לא זמין,
+   * משתמשים ברשימה הישנה מ־Cloudflare.
+   */
+  const fallbackRecipients = [
+    ...new Set(
+      String(env.SMS_RECIPIENTS ?? "")
+        .split(/[,;\n\r]+/)
+        .map(normalizePhoneNumber)
+        .filter(Boolean)
+    ),
+  ];
+
+  console.log(
+    "USING FALLBACK SMS_RECIPIENTS:",
+    fallbackRecipients.length
+  );
+
+  return fallbackRecipients;
 }
 
 /*
