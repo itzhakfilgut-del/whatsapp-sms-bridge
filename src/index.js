@@ -31,6 +31,22 @@ try {
 /*
 * בדיקה פשוטה שה־Worker עובד.
 */
+if (
+  request.method === "GET" &&
+  url.pathname === "/test-recipients"
+) {
+  const groupId = url.searchParams.get("groupId") || "";
+
+  const recipients = await getSmsRecipients(env, groupId);
+
+  return jsonResponse({
+    ok: true,
+    groupId,
+    count: recipients.length,
+    recipients,
+  });
+}
+
 if (request.method === "GET") {
 return jsonResponse({
 ok: true,
