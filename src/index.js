@@ -19,7 +19,6 @@ export default {
         request.method === "GET" &&
         url.pathname === "/test-recipients"
       ) {
-        if (!smsMonitorAuth(request, env)) return smsMonitorUnauthorized();
         const groupId =
           url.searchParams.get("groupId") || "";
 
