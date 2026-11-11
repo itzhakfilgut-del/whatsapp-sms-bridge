@@ -324,10 +324,6 @@ async function handleGreenApiWebhook(
   /*
    * רק קבוצות WhatsApp
    */
-  const allowedGroupIds = String(env.ALLOWED_GROUP_IDS || "").split(/[\s,;]+/).filter(Boolean);
-  if (!allowedGroupIds.length || !allowedGroupIds.includes(chatId)) {
-    return ignored("Group not authorized");
-  }
 
   if (!chatId.endsWith("@g.us")) {
     return ignored(
