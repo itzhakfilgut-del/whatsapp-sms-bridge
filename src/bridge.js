@@ -70,6 +70,7 @@ export default {async fetch(request,env){
  }catch(error){console.error('STAGING WORKER ERROR',String(error));return json({error:'internal'},500)}
 }};
 
+
 function base64url(bytes){return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'')}
 async function getGoogleToken(serviceAccount){
  const pem=serviceAccount.private_key.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s/g,'');
@@ -87,4 +88,10 @@ async function push(env,token){
  let sa=JSON.parse(env.GOOGLE_SERVICE_ACCOUNT_JSON);let access=await getGoogleToken(sa);
  let response=await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(sa.project_id)}/messages:send`,{method:'POST',headers:{Authorization:'Bearer '+access,'Content-Type':'application/json'},body:JSON.stringify({message:{token,data:{type:'sms_job'},android:{priority:'HIGH'}}})});
  if(!response.ok)throw Error('FCM HTTP '+response.status);
+}
+
+
+// Used by the WhatsApp router. A push failure leaves queued jobs intact.
+export async function notifyPhone(env, token) {
+  if (token) await push(env, token);
 }

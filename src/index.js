@@ -1,8 +1,10 @@
-import bridgeWorker from "./bridge.js";
+import bridgeWorker, { notifyPhone } from "./bridge.js";
+
 
 const DEDUPE_TTL_SECONDS = 60 * 60 * 24 * 7;
 const MAX_SMS_LENGTH = 800;
 const SMS_BATCH_SIZE = 100;
+
 
 export default {
   async fetch(request, env) {
@@ -21,10 +23,12 @@ export default {
   });
 }
 
+
     if (request.method === "GET" && (url.pathname === "/admin/sms" || url.pathname === "/admin/sms/export.csv")) {
       try { return await smsMonitorRoute(request, env); }
       catch (error) { console.error("SMS DASHBOARD FAILED", String(error)); return new Response("Dashboard unavailable", {status:503}); }
     }
+
 
     try {
       /*
@@ -37,8 +41,10 @@ export default {
         const groupId =
           url.searchParams.get("groupId") || "";
 
+
         const recipients =
           await getSmsRecipients(env, groupId);
+
 
         return jsonResponse({
           ok: true,
@@ -47,6 +53,7 @@ export default {
           recipients
         });
       }
+
 
       /*
        * בדיקת Worker
@@ -63,6 +70,7 @@ export default {
         });
       }
 
+
       /*
        * GREEN API WEBHOOK
        */
@@ -76,11 +84,14 @@ export default {
         );
       }
 
+
       return new Response("Not found", {
         status: 404
       });
 
+
     } catch (error) {
+
 
       console.error(
         "UNHANDLED ERROR:",
@@ -88,6 +99,7 @@ export default {
           ? error.stack || error.message
           : String(error)
       );
+
 
       return jsonResponse(
         {
@@ -101,15 +113,19 @@ export default {
 };
 
 
+
+
 /* =========================================================
    GREEN API
 ========================================================= */
+
 
 async function handleGreenApiWebhook(
   request,
   env
 ) {
   let webhook;
+
 
   try {
     webhook = await request.json();
@@ -123,20 +139,24 @@ async function handleGreenApiWebhook(
     );
   }
 
+
   const typeWebhook = String(
     webhook?.typeWebhook ?? ""
   );
+
 
   /*
    * התראה על ניתוק WhatsApp
    */
   if (typeWebhook === "stateInstanceChanged") {
 
+
     const stateInstance = String(
       webhook?.stateInstance ??
       webhook?.instanceData?.stateInstance ??
       ""
     );
+
 
     console.log(
       "GREEN API INSTANCE STATE:",
@@ -146,11 +166,13 @@ async function handleGreenApiWebhook(
       })
     );
 
+
     const disconnectedStates = [
       "notAuthorized",
       "blocked",
       "yellowCard"
     ];
+
 
     if (
       !disconnectedStates.includes(
@@ -165,13 +187,16 @@ async function handleGreenApiWebhook(
       });
     }
 
+
     const alertId =
       `green-state:${stateInstance}`;
+
 
     const alreadyAlerted =
       await env.MESSAGE_DEDUPE.get(
         alertId
       );
+
 
     if (alreadyAlerted) {
       return jsonResponse({
@@ -182,18 +207,22 @@ async function handleGreenApiWebhook(
       });
     }
 
+
     const alertMessage =
       stateInstance === "yellowCard"
         ? "אזהרה: חשבון ה-WhatsApp של המערכת קיבל כרטיס צהוב. יש לבדוק מיד את GREEN-API ולהפסיק שליחות עד לבירור."
         : "חיבור ה-WhatsApp של המערכת התנתק. יש להיכנס ל-GREEN-API ולחבר מחדש את המספר.";
 
+
     try {
+
 
       const smsResult =
         await sendAdminAlertSms(
           alertMessage,
           env
         );
+
 
       await env.MESSAGE_DEDUPE.put(
         alertId,
@@ -204,6 +233,7 @@ async function handleGreenApiWebhook(
         }
       );
 
+
       console.log(
         "WHATSAPP DISCONNECT ALERT SENT:",
         JSON.stringify({
@@ -213,13 +243,16 @@ async function handleGreenApiWebhook(
         })
       );
 
+
       return jsonResponse({
         ok: true,
         alertSent: true,
         stateInstance
       });
 
+
     } catch (error) {
+
 
       console.error(
         "WHATSAPP DISCONNECT ALERT FAILED:",
@@ -227,6 +260,7 @@ async function handleGreenApiWebhook(
           ? error.message
           : String(error)
       );
+
 
       return jsonResponse({
         ok: false,
@@ -241,6 +275,8 @@ async function handleGreenApiWebhook(
   }
 
 
+
+
   /*
    * סוגי הודעות שאנחנו מקבלים
    */
@@ -249,6 +285,7 @@ async function handleGreenApiWebhook(
     "outgoingMessageReceived",
     "outgoingAPIMessageReceived"
   ];
+
 
   /*
    * אם זה לא webhook של הודעה אמיתית,
@@ -269,10 +306,13 @@ async function handleGreenApiWebhook(
       })
     );
 
+
     return ignored(
       `Unsupported webhook type: ${typeWebhook}`
     );
   }
+
+
 
 
   /*
@@ -282,36 +322,45 @@ async function handleGreenApiWebhook(
     webhook?.idMessage ?? ""
   );
 
+
   const chatId = String(
     webhook?.senderData?.chatId ?? ""
   );
 
+
   const sender = String(
     webhook?.senderData?.sender ?? ""
   );
+
 
   const senderName =
     String(
       webhook?.senderData?.senderName ?? ""
     ).trim() ||
 
+
     String(
       webhook?.senderData?.senderContactName ?? ""
     ).trim() ||
 
+
     "לא ידוע";
+
 
   const text =
     extractWhatsappText(webhook).trim();
+
 
   const firstWord =
     text
       .split(/\s+/)
       .filter(Boolean)[0] ?? "";
 
+
   const typeMessage = String(
     webhook?.messageData?.typeMessage ?? ""
   );
+
 
   /*
    * הלוג הזה נכתב רק אחרי שווידאנו
@@ -335,15 +384,20 @@ async function handleGreenApiWebhook(
   );
 
 
+
+
   /*
    * רק קבוצות WhatsApp
    */
+
 
   if (!chatId.endsWith("@g.us")) {
     return ignored(
       "Message is not from a group"
     );
   }
+
+
 
 
   /*
@@ -356,8 +410,11 @@ async function handleGreenApiWebhook(
   }
 
 
+
+
   const smsText =
     text.slice(2).trim();
+
 
   if (!smsText) {
     return ignored(
@@ -366,11 +423,15 @@ async function handleGreenApiWebhook(
   }
 
 
+
+
   if (!messageId) {
+
 
     console.error(
       "MISSING GREEN API MESSAGE ID"
     );
+
 
     return jsonResponse(
       {
@@ -382,19 +443,25 @@ async function handleGreenApiWebhook(
   }
 
 
+
+
   /* =======================================================
      DEDUPE
   ======================================================= */
 
+
   const dedupeKey =
     `wa-in:${messageId}`;
+
 
   const existingStatus =
     await env.MESSAGE_DEDUPE.get(
       dedupeKey
     );
 
+
   if (existingStatus) {
+
 
     console.log(
       "DUPLICATE WHATSAPP MESSAGE IGNORED:",
@@ -404,6 +471,7 @@ async function handleGreenApiWebhook(
       })
     );
 
+
     return jsonResponse({
       ok: true,
       ignored: true,
@@ -412,6 +480,8 @@ async function handleGreenApiWebhook(
       existingStatus
     });
   }
+
+
 
 
   await env.MESSAGE_DEDUPE.put(
@@ -424,11 +494,15 @@ async function handleGreenApiWebhook(
   );
 
 
+
+
   const cleanSmsText =
     smsText.slice(
       0,
       MAX_SMS_LENGTH
     );
+
+
 
 
   console.log(
@@ -444,51 +518,67 @@ async function handleGreenApiWebhook(
   );
 
 
+
+
   try {
+
 
     const smsResult =
       await sendSms4Free(
         cleanSmsText,
         env,
-        chatId
+        chatId,
+        sender,
+        messageId
       );
 
+
+    const phoneQueued = smsResult.route === "PHONE";
     await smsLogSafely(env, { messageId, chatId, sender, message: cleanSmsText,
-      recipientCount: smsResult.totalRecipients || 0, route: "SMS4FREE", status: "SENT" });
+      recipientCount: smsResult.totalRecipients || 0, route: phoneQueued ? "PHONE" : "SMS4FREE", status: phoneQueued ? "QUEUED" : "SENT" });
+
 
     await env.MESSAGE_DEDUPE.put(
       dedupeKey,
-      "SENT",
+      phoneQueued ? "QUEUED" : "SENT",
       {
         expirationTtl:
           DEDUPE_TTL_SECONDS
       }
     );
 
+
     console.log(
       "SMS SENT SUCCESSFULLY:",
       JSON.stringify({
         messageId,
 
+
         totalRecipients:
           smsResult.totalRecipients,
 
+
         senderCount:
           smsResult.senderCount,
+
 
         batchCount:
           smsResult.batchCount
       })
     );
 
+
     return jsonResponse({
       ok: true,
-      sent: true,
+      sent: !phoneQueued,
+      queued: phoneQueued,
       messageId,
       smsResult
     });
 
+
   } catch (error) {
+
 
     /*
      * אם השליחה נכשלה,
@@ -499,8 +589,10 @@ async function handleGreenApiWebhook(
     try { await env.MESSAGE_DEDUPE.put(dedupeKey, "REVIEW_REQUIRED", {expirationTtl: DEDUPE_TTL_SECONDS}); }
     catch (kvError) { console.error("DEDUPE STATUS UPDATE FAILED", String(kvError)); }
 
+
     await smsLogSafely(env, {messageId, chatId, sender, message: cleanSmsText,
       recipientCount: 0, route: "SMS4FREE", status: "REVIEW_REQUIRED", error: String(error)});
+
 
     console.error(
       "SMS SEND FAILED:",
@@ -508,6 +600,7 @@ async function handleGreenApiWebhook(
         ? error.message
         : String(error)
     );
+
 
     return jsonResponse({
       ok: false,
@@ -522,15 +615,21 @@ async function handleGreenApiWebhook(
 }
 
 
+
+
 /* =========================================================
    שליחת SMS לפי Sender של כל אדם
 ========================================================= */
 
+
 async function sendSms4Free(
   message,
   env,
-  chatId
+  chatId,
+  whatsappAuthor,
+  messageId
 ) {
+
 
   const requiredSecrets = [
     "SMS4FREE_KEY",
@@ -539,10 +638,12 @@ async function sendSms4Free(
     "SMS4FREE_SENDER"
   ];
 
+
   for (
     const secretName
     of requiredSecrets
   ) {
+
 
     if (!env[secretName]) {
       throw new Error(
@@ -550,6 +651,8 @@ async function sendSms4Free(
       );
     }
   }
+
+
 
 
   /*
@@ -570,12 +673,56 @@ async function sendSms4Free(
     );
 
 
+
+
+  // Prefer the WhatsApp author's connected phone; fall back before queueing.
+  if (env.ENABLE_PHONE_SMS === "true" && env.SMS_DB && env.ENABLE_BRIDGE_API === "true") {
+    const whatsappSender = normalizePhoneNumber(whatsappAuthor);
+    let device = null;
+    if (/^972[0-9]{8,10}$/.test(whatsappSender)) {
+      try {
+        device = await env.SMS_DB.prepare(
+          "SELECT id,fcm_token FROM devices WHERE sender=? AND enabled=1 AND last_seen_at >= ? ORDER BY last_seen_at DESC LIMIT 1"
+        ).bind(whatsappSender, Date.now() - 30 * 60 * 1000).first();
+      } catch (error) {
+        console.error("PHONE DEVICE LOOKUP FAILED, USING SMS4FREE:", String(error));
+      }
+    }
+    if (device) {
+      const phones = [...new Set(recipients.map(r => normalizePhoneNumber(r.phone))
+        .filter(p => /^\+?[0-9]{9,15}$/.test(p)))];
+      if (phones.length === 0) {
+        return { status: 1, message: "No recipients", totalRecipients: 0,
+          senderCount: 0, batchCount: 0, senders: [], route: "PHONE" };
+      }
+      // D1 batch is transactional; never fall back after attempting to queue.
+      const statements = await Promise.all(phones.map(async phone => {
+        const bytes = new TextEncoder().encode(`${messageId}|${phone}`);
+        const digest = await crypto.subtle.digest("SHA-256", bytes);
+        const id = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+        return env.SMS_DB.prepare(
+          "INSERT OR IGNORE INTO jobs(id,device_id,phone,text,status,created_at) VALUES(?,?,?,?,'PENDING',?)"
+        ).bind(id, device.id, phone, message, Date.now());
+      }));
+      await env.SMS_DB.batch(statements);
+      if (device.fcm_token) {
+        try { await notifyPhone(env, device.fcm_token); }
+        catch (error) { console.error("PHONE PUSH FAILED; JOBS REMAIN QUEUED:", String(error)); }
+      }
+      return { status: 1, message: "Queued on phone", totalRecipients: phones.length,
+        senderCount: 1, batchCount: 0, senders: [], route: "PHONE" };
+    }
+  }
+
+
   if (recipients.length === 0) {
+
 
     return {
       status: 1,
       message:
         "No recipients for this group",
+
 
       totalRecipients: 0,
       senderCount: 0,
@@ -583,6 +730,8 @@ async function sendSms4Free(
       senders: []
     };
   }
+
+
 
 
   /*
@@ -596,16 +745,21 @@ async function sendSms4Free(
     new Map();
 
 
+
+
   for (const recipient of recipients) {
+
 
     const phone =
       normalizePhoneNumber(
         recipient.phone
       );
 
+
     if (!phone) {
       continue;
     }
+
 
     const smsSender =
       String(
@@ -614,6 +768,8 @@ async function sendSms4Free(
       String(
         env.SMS4FREE_SENDER
       ).trim();
+
+
 
 
     if (
@@ -627,10 +783,13 @@ async function sendSms4Free(
       );
     }
 
+
     recipientsBySender
       .get(smsSender)
       .push(phone);
   }
+
+
 
 
   /*
@@ -645,6 +804,7 @@ async function sendSms4Free(
     of recipientsBySender.entries()
   ) {
 
+
     recipientsBySender.set(
       smsSender,
       [...new Set(phones)]
@@ -652,10 +812,15 @@ async function sendSms4Free(
   }
 
 
+
+
   const senderResults = [];
+
 
   let totalRecipients = 0;
   let totalBatches = 0;
+
+
 
 
   /*
@@ -669,13 +834,17 @@ async function sendSms4Free(
     of recipientsBySender.entries()
   ) {
 
+
     const batches =
       chunkArray(
         phones,
         SMS_BATCH_SIZE
       );
 
+
     const batchResults = [];
+
+
 
 
     console.log(
@@ -690,14 +859,18 @@ async function sendSms4Free(
     );
 
 
+
+
     for (
       let batchIndex = 0;
       batchIndex < batches.length;
       batchIndex++
     ) {
 
+
       const batch =
         batches[batchIndex];
+
 
       console.log(
         "SENDING SMS BATCH:",
@@ -705,11 +878,14 @@ async function sendSms4Free(
           sender:
             smsSender,
 
+
           batchNumber:
             batchIndex + 1,
 
+
           totalBatches:
             batches.length,
+
 
           recipientCount:
             batch.length
@@ -717,54 +893,73 @@ async function sendSms4Free(
       );
 
 
+
+
       const result =
         await sendSms4FreeRequest({
           message,
 
+
           recipients:
             batch,
+
 
           sender:
             smsSender,
 
+
           env,
+
 
           batchNumber:
             batchIndex + 1
         });
 
 
+
+
       batchResults.push({
         batchNumber:
           batchIndex + 1,
 
+
         recipientCount:
           batch.length,
 
+
         status:
           result.status,
+
 
         message:
           result.message
       });
 
+
       totalBatches++;
     }
+
+
 
 
     totalRecipients +=
       phones.length;
 
 
+
+
     senderResults.push({
       sender:
         smsSender,
 
+
       recipientCount:
         phones.length,
 
+
       batchCount:
         batches.length,
+
 
       batches:
         batchResults
@@ -772,19 +967,26 @@ async function sendSms4Free(
   }
 
 
+
+
   return {
     status: 1,
+
 
     message:
       "All SMS batches sent successfully",
 
+
     totalRecipients,
+
 
     senderCount:
       senderResults.length,
 
+
     batchCount:
       totalBatches,
+
 
     senders:
       senderResults
@@ -792,9 +994,12 @@ async function sendSms4Free(
 }
 
 
+
+
 /* =========================================================
    בקשת SMS4FREE
 ========================================================= */
+
 
 async function sendSms4FreeRequest({
   message,
@@ -804,33 +1009,42 @@ async function sendSms4FreeRequest({
   batchNumber
 }) {
 
+
   const response =
     await fetch(
       "https://api.sms4free.co.il/ApiSMS/v2/SendSMS",
       {
         method: "POST",
 
+
         headers: {
           "Content-Type":
             "application/json"
         },
 
+
         body: JSON.stringify({
+
 
           key:
             env.SMS4FREE_KEY,
 
+
           user:
             env.SMS4FREE_USER,
+
 
           pass:
             env.SMS4FREE_PASS,
 
+
           sender:
             sender,
 
+
           recipient:
             recipients.join(";"),
+
 
           msg:
             message
@@ -839,18 +1053,26 @@ async function sendSms4FreeRequest({
     );
 
 
+
+
   const rawText =
     await response.text();
 
 
+
+
   let result;
 
+
   try {
+
 
     result =
       JSON.parse(rawText);
 
+
   } catch {
+
 
     throw new Error(
       JSON.stringify({
@@ -858,6 +1080,7 @@ async function sendSms4FreeRequest({
         sender,
         httpStatus:
           response.status,
+
 
         rawResponse:
           rawText.slice(
@@ -869,23 +1092,31 @@ async function sendSms4FreeRequest({
   }
 
 
+
+
   if (
     !response.ok ||
     Number(result?.status) <= 0
   ) {
 
+
     throw new Error(
       JSON.stringify({
 
+
         batchNumber,
 
+
         sender,
+
 
         recipientCount:
           recipients.length,
 
+
         httpStatus:
           response.status,
+
 
         smsResult:
           result
@@ -894,18 +1125,24 @@ async function sendSms4FreeRequest({
   }
 
 
+
+
   return result;
 }
+
+
 
 
 /* =========================================================
    התראת מנהל
 ========================================================= */
 
+
 async function sendAdminAlertSms(
   message,
   env
 ) {
+
 
   const requiredSecrets = [
     "SMS4FREE_KEY",
@@ -916,12 +1153,16 @@ async function sendAdminAlertSms(
   ];
 
 
+
+
   for (
     const secretName
     of requiredSecrets
   ) {
 
+
     if (!env[secretName]) {
+
 
       throw new Error(
         `Missing Cloudflare secret: ${secretName}`
@@ -930,18 +1171,25 @@ async function sendAdminAlertSms(
   }
 
 
+
+
   const adminPhone =
     normalizePhoneNumber(
       env.ADMIN_ALERT_PHONE
     );
 
 
+
+
   if (!adminPhone) {
+
 
     throw new Error(
       "Invalid ADMIN_ALERT_PHONE"
     );
   }
+
+
 
 
   const response =
@@ -950,27 +1198,35 @@ async function sendAdminAlertSms(
       {
         method: "POST",
 
+
         headers: {
           "Content-Type":
             "application/json"
         },
 
+
         body: JSON.stringify({
+
 
           key:
             env.SMS4FREE_KEY,
 
+
           user:
             env.SMS4FREE_USER,
+
 
           pass:
             env.SMS4FREE_PASS,
 
+
           sender:
             env.SMS4FREE_SENDER,
 
+
           recipient:
             adminPhone,
+
 
           msg:
             message
@@ -979,24 +1235,34 @@ async function sendAdminAlertSms(
     );
 
 
+
+
   const rawText =
     await response.text();
+
+
 
 
   let result;
 
 
+
+
   try {
+
 
     result =
       JSON.parse(rawText);
 
+
   } catch {
+
 
     throw new Error(
       JSON.stringify({
         httpStatus:
           response.status,
+
 
         rawResponse:
           rawText.slice(
@@ -1008,15 +1274,19 @@ async function sendAdminAlertSms(
   }
 
 
+
+
   if (
     !response.ok ||
     Number(result?.status) <= 0
   ) {
 
+
     throw new Error(
       JSON.stringify({
         httpStatus:
           response.status,
+
 
         smsResult:
           result
@@ -1025,25 +1295,33 @@ async function sendAdminAlertSms(
   }
 
 
+
+
   return result;
 }
+
+
 
 
 /* =========================================================
    קבלת נמענים מ-Google Apps Script
 ========================================================= */
 
+
 async function getSmsRecipients(
   env,
   groupId
 ) {
+
 
   if (
     env.RECIPIENTS_API_URL &&
     env.RECIPIENTS_API_SECRET
   ) {
 
+
     try {
+
 
       const response =
         await fetch(
@@ -1051,14 +1329,17 @@ async function getSmsRecipients(
           {
             method: "POST",
 
+
             headers: {
               "Content-Type":
                 "application/json"
             },
 
+
             body: JSON.stringify({
               secret:
                 env.RECIPIENTS_API_SECRET,
+
 
               groupId
             })
@@ -1066,7 +1347,10 @@ async function getSmsRecipients(
         );
 
 
+
+
       if (!response.ok) {
+
 
         throw new Error(
           `Recipients API returned HTTP ${response.status}`
@@ -1074,8 +1358,12 @@ async function getSmsRecipients(
       }
 
 
+
+
       const data =
         await response.json();
+
+
 
 
       if (
@@ -1084,6 +1372,7 @@ async function getSmsRecipients(
           data.recipients
         )
       ) {
+
 
         /*
          * פורמט חדש:
@@ -1097,6 +1386,7 @@ async function getSmsRecipients(
           data.recipients
             .map(item => {
 
+
               /*
                * תמיכה גם בפורמט החדש
                */
@@ -1105,11 +1395,13 @@ async function getSmsRecipients(
                 typeof item === "object"
               ) {
 
+
                 return {
                   phone:
                     normalizePhoneNumber(
                       item.phone
                     ),
+
 
                   sender:
                     String(
@@ -1117,6 +1409,8 @@ async function getSmsRecipients(
                     ).trim()
                 };
               }
+
+
 
 
               /*
@@ -1130,15 +1424,19 @@ async function getSmsRecipients(
                     item
                   ),
 
+
                 sender:
                   ""
               };
             })
 
+
             .filter(
               item =>
                 Boolean(item.phone)
             );
+
+
 
 
         console.log(
@@ -1147,20 +1445,27 @@ async function getSmsRecipients(
             count:
               recipients.length,
 
+
             groupId
           })
         );
+
+
 
 
         return recipients;
       }
 
 
+
+
       throw new Error(
         "Recipients API returned invalid response"
       );
 
+
     } catch (error) {
+
 
       console.error(
         "GOOGLE SHEETS RECIPIENTS FAILED:",
@@ -1172,10 +1477,13 @@ async function getSmsRecipients(
   }
 
 
+
+
   // Never fall back to an unscoped, global recipient list for a scoped WhatsApp group.
   if (env.RECIPIENTS_API_URL && env.RECIPIENTS_API_SECRET) {
     throw new Error("Recipients API unavailable: group-specific recipients cannot be verified");
   }
+
 
   /*
    * FALLBACK ישן:
@@ -1202,73 +1510,93 @@ async function getSmsRecipients(
     }));
 
 
+
+
   console.log(
     "USING FALLBACK SMS_RECIPIENTS:",
     fallbackRecipients.length
   );
 
 
+
+
   return fallbackRecipients;
 }
+
+
 
 
 /* =========================================================
    WhatsApp text
 ========================================================= */
 
+
 function extractWhatsappText(
   webhook
 ) {
 
+
   return String(
+
 
     webhook
       ?.messageData
       ?.textMessageData
       ?.textMessage ??
 
+
     webhook
       ?.messageData
       ?.extendedTextMessageData
       ?.text ??
+
 
     webhook
       ?.messageData
       ?.quotedMessage
       ?.textMessage ??
 
+
     ""
   );
 }
+
+
 
 
 /* =========================================================
    טלפון
 ========================================================= */
 
+
 function normalizePhoneNumber(
   value
 ) {
+
 
   return String(
     value ?? ""
   )
     .trim()
 
+
     .replace(
       /[^\d+]/g,
       ""
     )
+
 
     .replace(
       /^9720/,
       "972"
     )
 
+
     .replace(
       /^0/,
       "972"
     )
+
 
     .replace(
       /^\+/,
@@ -1277,16 +1605,22 @@ function normalizePhoneNumber(
 }
 
 
+
+
 /* =========================================================
    חלוקה לבאצ'ים
 ========================================================= */
+
 
 function chunkArray(
   items,
   chunkSize
 ) {
 
+
   const chunks = [];
+
+
 
 
   for (
@@ -1294,6 +1628,7 @@ function chunkArray(
     index < items.length;
     index += chunkSize
   ) {
+
 
     chunks.push(
       items.slice(
@@ -1304,15 +1639,21 @@ function chunkArray(
   }
 
 
+
+
   return chunks;
 }
+
+
 
 
 /* =========================================================
    ignored
 ========================================================= */
 
+
 function ignored(reason) {
+
 
   return jsonResponse({
     ok: true,
@@ -1322,23 +1663,29 @@ function ignored(reason) {
 }
 
 
+
+
 /* =========================================================
    JSON
 ========================================================= */
+
 
 function jsonResponse(
   data,
   status = 200
 ) {
 
+
   return new Response(
     JSON.stringify(data),
     {
       status,
 
+
       headers: {
         "Content-Type":
           "application/json; charset=utf-8",
+
 
         "Cache-Control":
           "no-store"
@@ -1348,10 +1695,12 @@ function jsonResponse(
 }
 /* SMS MONITOR ADD-ON */
 
+
 function smsUnitCount(message) {
   const len = [...String(message || '')].length;
   return len <= 0 ? 0 : len <= 134 ? 1 : 1 + Math.ceil((len - 134) / 67);
 }
+
 
 async function smsLogSafely(env, data) {
   if (!env.SMS_DB) {
@@ -1387,11 +1736,13 @@ async function smsLogSafely(env, data) {
   }
 }
 
+
 function smsEsc(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[ch]));
 }
+
 
 function smsMonitorUnauthorized() {
   return new Response('Authentication required', {
@@ -1399,6 +1750,7 @@ function smsMonitorUnauthorized() {
     headers: {'WWW-Authenticate': 'Basic realm="SMS Monitor", charset="UTF-8"', 'Cache-Control':'no-store'}
   });
 }
+
 
 function smsMonitorAuth(request, env) {
   const expectedUser = String(env.SMS_ADMIN_USER || '');
@@ -1412,6 +1764,7 @@ function smsMonitorAuth(request, env) {
     return index !== -1 && decoded.slice(0,index) === expectedUser && decoded.slice(index+1) === expectedPass;
   } catch {return false;}
 }
+
 
 async function smsMonitorRoute(request, env) {
   if (!smsMonitorAuth(request, env)) return smsMonitorUnauthorized();
