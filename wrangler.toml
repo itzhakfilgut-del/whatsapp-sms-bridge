@@ -6,3 +6,8 @@ keep_vars = true
 [[kv_namespaces]]
 binding = "MESSAGE_DEDUPE"
 id = "7733731215b942f4aab2dffa52084b54"
+
+[[d1_databases]]
+binding = "SMS_DB"
+database_name = "sms-monitor"
+database_id = "bee993d7-ad90-4533-861e-30233e4eefac"
