@@ -1,3 +1,5 @@
+import bridgeWorker from "./bridge.js";
+
 const DEDUPE_TTL_SECONDS = 60 * 60 * 24 * 7;
 const MAX_SMS_LENGTH = 800;
 const SMS_BATCH_SIZE = 100;
@@ -5,6 +7,19 @@ const SMS_BATCH_SIZE = 100;
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (
+  env.ENABLE_BRIDGE_API === "true" &&
+  (
+    url.pathname.startsWith("/device/") ||
+    url.pathname === "/admin/job" ||
+    url.pathname === "/admin/jobs"
+  )
+) {
+  return bridgeWorker.fetch(request, {
+    ...env,
+    DB: env.SMS_DB
+  });
+}
 
     if (request.method === "GET" && (url.pathname === "/admin/sms" || url.pathname === "/admin/sms/export.csv")) {
       try { return await smsMonitorRoute(request, env); }
