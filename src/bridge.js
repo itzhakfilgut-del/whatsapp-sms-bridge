@@ -1,5 +1,4 @@
-// ISOLATED STAGING WORKER. DO NOT REPLACE THE LIVE WHATSAPP WORKER WITH THIS FILE.
-// Requires D1 binding DB and secrets ADMIN_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON.
+// Integrated phone bridge on the existing Worker; D1 database is provided as env.DB.
 const json=(obj,status=200)=>new Response(JSON.stringify(obj),{status,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store'}});
 const uid=()=>crypto.randomUUID();
 const hash=async value=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)))).map(x=>x.toString(16).padStart(2,'0')).join('');
@@ -9,11 +8,10 @@ const isAdmin=(request,env)=>env.ADMIN_TOKEN && bearer(request)===env.ADMIN_TOKE
 async function body(request){try{return await request.json()}catch{return null}}
 export default {async fetch(request,env){
  const path=new URL(request.url).pathname;
- if(path==='/health')return json({ok:true,service:'sms-bridge-staging'});
+ if(path==='/health')return json({ok:true,service:'sms-bridge'});
  if(!env.DB)return json({error:'missing DB'},503);
  try{
-  // Trust-based registration requested for private installation: phone number alone identifies sender.
-  // Do NOT expose this staging endpoint to untrusted clients or use it on the live Worker.
+  // Existing registration semantics preserved.
   if(path==='/device/register' && request.method==='POST'){
    let d=await body(request);let sender=String(d?.sender||'').trim();
    if(!/^972[0-9]{8,10}$/.test(sender))return json({error:'invalid sender'},400);
@@ -39,13 +37,37 @@ export default {async fetch(request,env){
   let device=await authorized(request,env);if(!device)return json({error:'unauthorized'},401);
   if(path==='/device/heartbeat' && request.method==='POST'){
    let d=await body(request);let fcm=String(d?.fcmToken||'').slice(0,4096);let enabled=d?.enabled===true?1:0;
-   await env.DB.prepare('UPDATE devices SET fcm_token=?,enabled=?,last_seen_at=? WHERE id=?').bind(fcm,enabled,Date.now(),device.id).run();return json({ok:true});
+   await env.DB.prepare('UPDATE devices SET fcm_token=?,enabled=?,last_seen_at=? WHERE id=?').bind(fcm,enabled,Date.now(),device.id).run();
+   console.log('PHONE HEARTBEAT',JSON.stringify({sender:device.sender,enabled,hasFcm:Boolean(fcm)}));
+   return json({ok:true});
+  }
+  // Debug events: no tokens, phone destinations or message bodies are recorded.
+  if(path==='/device/diagnostic' && request.method==='POST'){
+   const d=await body(request)||{};
+   const stage=String(d.stage||'UNKNOWN').slice(0,40);
+   const result=String(d.result||'UNKNOWN').slice(0,24);
+   const detail=String(d.detail||'').slice(0,220);
+   const seen=Math.max(0,Math.min(100,Number(d.seen)||0));
+   const claimed=Math.max(0,Math.min(100,Number(d.claimed)||0));
+   const dispatched=Math.max(0,Math.min(100,Number(d.dispatched)||0));
+   const reportedAt=Date.now();
+   await env.DB.prepare('INSERT INTO device_diagnostics(device_id,reported_at,stage,result,detail,seen,claimed,dispatched) VALUES(?,?,?,?,?,?,?,?)')
+     .bind(device.id,reportedAt,stage,result,detail,seen,claimed,dispatched).run();
+   console.log('PHONE DIAGNOSTIC',JSON.stringify({sender:device.sender,stage,result,detail,seen,claimed,dispatched}));
+   return json({ok:true});
   }
   if(path==='/device/jobs' && request.method==='GET'){
-   let r=await env.DB.prepare("SELECT id,phone,text FROM jobs WHERE device_id=? AND status='PENDING' ORDER BY created_at LIMIT 10").bind(device.id).all();return json({jobs:r.results});
+   // Safety: never suddenly send days-old SMS after a phone reconnects.
+   // Older PENDING entries remain in D1 for manual review.
+   const cutoff=Date.now()-24*60*60*1000;
+   let r=await env.DB.prepare("SELECT id,phone,text FROM jobs WHERE device_id=? AND status='PENDING' AND created_at>=? ORDER BY created_at LIMIT 10")
+     .bind(device.id,cutoff).all();
+   console.log('PHONE JOBS FETCH',JSON.stringify({sender:device.sender,count:(r.results||[]).length}));
+   return json({jobs:r.results});
   }
   if(path==='/device/claim' && request.method==='POST'){
    let d=await body(request);let r=await env.DB.prepare("UPDATE jobs SET status='CLAIMED',claimed_at=? WHERE id=? AND device_id=? AND status='PENDING'").bind(Date.now(),d?.id,device.id).run();
+   console.log('PHONE JOB CLAIM',JSON.stringify({sender:device.sender,claimed:r.meta.changes===1}));
    return json({claimed:r.meta.changes===1});
   }
   if(path==='/device/dispatched' && request.method==='POST'){
@@ -67,9 +89,8 @@ export default {async fetch(request,env){
    await env.DB.prepare('UPDATE jobs SET status=?,completed_at=? WHERE id=? AND device_id=?').bind(finalStatus,finalStatus==='DISPATCHED'?null:Date.now(),d.id,device.id).run();return json({ok:true,status:finalStatus});
   }
   return json({error:'not found'},404);
- }catch(error){console.error('STAGING WORKER ERROR',String(error));return json({error:'internal'},500)}
+ }catch(error){console.error('BRIDGE ERROR',String(error));return json({error:'internal'},500)}
 }};
-
 
 function base64url(bytes){return btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'')}
 async function getGoogleToken(serviceAccount){
@@ -90,8 +111,6 @@ async function push(env,token){
  if(!response.ok)throw Error('FCM HTTP '+response.status);
 }
 
-
-// Used by the WhatsApp router. A push failure leaves queued jobs intact.
 export async function notifyPhone(env, token) {
   if (token) await push(env, token);
 }
