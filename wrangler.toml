@@ -3,6 +3,13 @@ main = "src/index.js"
 compatibility_date = "2026-08-28"
 keep_vars = true
 
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[triggers]
+crons = ["* * * * *"]
+
 [[kv_namespaces]]
 binding = "MESSAGE_DEDUPE"
 id = "7733731215b942f4aab2dffa52084b54"
