@@ -1,4 +1,5 @@
 import bridgeWorker, { notifyPhone } from "./bridge.js";
+import { verifyWhatsAppReply, auditMembership } from "./device-auth.js";
 
 
 const DEDUPE_TTL_SECONDS = 60 * 60 * 24 * 7;
@@ -10,6 +11,7 @@ export default {
   async scheduled(controller, env, ctx) {
     if (env.ENABLE_PHONE_SMS !== "true" || !env.SMS_DB) return;
     ctx.waitUntil(processPhoneFallbacks(env));
+    ctx.waitUntil(auditMembership(env).catch(e => console.error("DEVICE MEMBERSHIP AUDIT FAILED", String(e))));
   },
 
   async fetch(request, env) {
@@ -87,10 +89,16 @@ export default {
         request.method === "POST" &&
         url.pathname === "/webhooks/green-api"
       ) {
-        return await handleGreenApiWebhook(
-          request,
-          env
-        );
+        // Authenticity must be checked BEFORE processing confirmation replies or SMS.
+        if (!env.GREEN_API_WEBHOOK_TOKEN ||
+            request.headers.get("Authorization") !== `Bearer ${env.GREEN_API_WEBHOOK_TOKEN}`) {
+          return jsonResponse({ok:false,error:"Unauthorized"},401);
+        }
+        const candidate = await request.clone().json().catch(() => null);
+        if (candidate && await verifyWhatsAppReply(candidate, env)) {
+          return jsonResponse({ok:true, verification:true});
+        }
+        return await handleGreenApiWebhook(request, env);
       }
 
 
@@ -691,7 +699,7 @@ async function sendSms4Free(
     if (/^972[0-9]{8,10}$/.test(whatsappSender)) {
       try {
         device = await env.SMS_DB.prepare(
-          "SELECT id,fcm_token FROM devices WHERE sender=? AND enabled=1 AND last_seen_at >= ? ORDER BY last_seen_at DESC LIMIT 1"
+          "SELECT id,fcm_token FROM devices WHERE sender=? AND enabled=1 AND approved=1 AND revoked=0 AND last_seen_at >= ? ORDER BY last_seen_at DESC LIMIT 1"
         ).bind(whatsappSender, Date.now() - 30 * 60 * 1000).first();
       } catch (error) {
         console.error("PHONE DEVICE LOOKUP FAILED, USING SMS4FREE:", String(error));

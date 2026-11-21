@@ -1,9 +1,10 @@
 // Integrated phone bridge on the existing Worker; D1 database is provided as env.DB.
+import { registerVerifiedDevice, revokeDevice } from "./device-auth.js";
 const json=(obj,status=200)=>new Response(JSON.stringify(obj),{status,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store'}});
 const uid=()=>crypto.randomUUID();
 const hash=async value=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(value)))).map(x=>x.toString(16).padStart(2,'0')).join('');
 function bearer(request){const v=request.headers.get('Authorization')||'';return v.startsWith('Bearer ')?v.slice(7):''}
-async function authorized(request,env){let t=bearer(request);if(!t) return null;let h=await hash(t);return await env.DB.prepare('SELECT id,sender,enabled,fcm_token FROM devices WHERE token_hash=?').bind(h).first()}
+async function authorized(request,env){let t=bearer(request);if(!t) return null;let h=await hash(t);return await env.DB.prepare('SELECT id,sender,enabled,approved,revoked,fcm_token FROM devices WHERE token_hash=?').bind(h).first()}
 const isAdmin=(request,env)=>env.ADMIN_TOKEN && bearer(request)===env.ADMIN_TOKEN;
 async function body(request){try{return await request.json()}catch{return null}}
 export default {async fetch(request,env){
@@ -13,17 +14,13 @@ export default {async fetch(request,env){
  try{
   // Existing registration semantics preserved.
   if(path==='/device/register' && request.method==='POST'){
-   let d=await body(request);let sender=String(d?.sender||'').trim();
-   if(!/^972[0-9]{8,10}$/.test(sender))return json({error:'invalid sender'},400);
-   let token=Array.from(crypto.getRandomValues(new Uint8Array(32))).map(x=>x.toString(16).padStart(2,'0')).join('');
-   await env.DB.prepare('INSERT INTO devices(id,sender,token_hash,enabled,created_at) VALUES(?,?,?,?,?)').bind(uid(),sender,await hash(token),1,Date.now()).run();
-   return json({token,sender});
+   return registerVerifiedDevice(request,env);
   }
   if(path==='/admin/job' && request.method==='POST'){
    if(!isAdmin(request,env))return json({error:'unauthorized'},401);
    let d=await body(request);let sender=String(d?.sender||'').trim(),phone=String(d?.phone||''),text=String(d?.text||'');
    if(!/^\+?[0-9]{9,15}$/.test(phone)||!text||text.length>800)return json({error:'invalid recipient/message'},400);
-   let device=await env.DB.prepare('SELECT id,fcm_token FROM devices WHERE sender=? AND enabled=1 ORDER BY created_at DESC LIMIT 1').bind(sender).first();
+   let device=await env.DB.prepare('SELECT id,fcm_token FROM devices WHERE sender=? AND enabled=1 AND approved=1 AND revoked=0 ORDER BY created_at DESC LIMIT 1').bind(sender).first();
    if(!device)return json({error:'no active device; job not created'},409);
    let id=uid();await env.DB.prepare("INSERT INTO jobs(id,device_id,phone,text,status,created_at) VALUES(?,?,?,?, 'PENDING', ?)").bind(id,device.id,phone,text,Date.now()).run();
    let pushed=false;
@@ -35,11 +32,21 @@ export default {async fetch(request,env){
    let r=await env.DB.prepare('SELECT id,status,created_at,claimed_at,completed_at FROM jobs ORDER BY created_at DESC LIMIT 100').all();return json({jobs:r.results});
   }
   let device=await authorized(request,env);if(!device)return json({error:'unauthorized'},401);
+  if(path==='/device/status' && request.method==='GET'){
+   return json({status:device.revoked?'revoked':device.approved?'approved':'pending',approved:device.approved===1,enabled:device.enabled===1});
+  }
+  if(path==='/device/revoke' && request.method==='POST') return revokeDevice(request,env,device);
   if(path==='/device/heartbeat' && request.method==='POST'){
+   if(device.revoked) return json({error:'device revoked'},403);
    let d=await body(request);let fcm=String(d?.fcmToken||'').slice(0,4096);let enabled=d?.enabled===true?1:0;
    await env.DB.prepare('UPDATE devices SET fcm_token=?,enabled=?,last_seen_at=? WHERE id=?').bind(fcm,enabled,Date.now(),device.id).run();
    console.log('PHONE HEARTBEAT',JSON.stringify({sender:device.sender,enabled,hasFcm:Boolean(fcm)}));
    return json({ok:true});
+  }
+  // Unapproved devices may report diagnostics but may never see or claim SMS jobs.
+  if(device.revoked) return json({error:'device revoked'},403);
+  if(path!=='/device/diagnostic' && (!device.approved || !device.enabled)) {
+   return json({error:'device not approved or disabled'},403);
   }
   // Debug events: no tokens, phone destinations or message bodies are recorded.
   if(path==='/device/diagnostic' && request.method==='POST'){
