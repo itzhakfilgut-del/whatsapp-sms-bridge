@@ -7,6 +7,11 @@ const SMS_BATCH_SIZE = 100;
 
 
 export default {
+  async scheduled(controller, env, ctx) {
+    if (env.ENABLE_PHONE_SMS !== "true" || !env.SMS_DB) return;
+    ctx.waitUntil(processPhoneFallbacks(env));
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
     if (
@@ -549,7 +554,7 @@ async function handleGreenApiWebhook(
 
 
     console.log(
-      "SMS SENT SUCCESSFULLY:",
+      phoneQueued ? "PHONE JOBS QUEUED (NOT YET SENT):" : "SMS4FREE REQUEST ACCEPTED:",
       JSON.stringify({
         messageId,
 
@@ -689,21 +694,35 @@ async function sendSms4Free(
       }
     }
     if (device) {
-      const phones = [...new Set(recipients.map(r => normalizePhoneNumber(r.phone))
-        .filter(p => /^\+?[0-9]{9,15}$/.test(p)))];
+      // Keep the Google Sheets SMS4FREE sender for each recipient's backup.
+      const byPhone = new Map();
+      for (const recipient of recipients) {
+        const phone = normalizePhoneNumber(recipient.phone);
+        if (!/^\+?[0-9]{9,15}$/.test(phone) || byPhone.has(phone)) continue;
+        byPhone.set(phone, {
+          phone,
+          smsSender: String(recipient.sender || "").trim() || String(env.SMS4FREE_SENDER).trim()
+        });
+      }
+      const phones = [...byPhone.values()];
       if (phones.length === 0) {
         return { status: 1, message: "No recipients", totalRecipients: 0,
           senderCount: 0, batchCount: 0, senders: [], route: "PHONE" };
       }
-      // D1 batch is transactional; never fall back after attempting to queue.
-      const statements = await Promise.all(phones.map(async phone => {
-        const bytes = new TextEncoder().encode(`${messageId}|${phone}`);
+      // D1.batch is transactional. Each new phone job gets a matching fallback record.
+      // Existing jobs (from before this migration) are intentionally NOT backfilled.
+      const statements = [];
+      for (const recipient of phones) {
+        const bytes = new TextEncoder().encode(`${messageId}|${recipient.phone}`);
         const digest = await crypto.subtle.digest("SHA-256", bytes);
         const id = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
-        return env.SMS_DB.prepare(
+        statements.push(env.SMS_DB.prepare(
           "INSERT OR IGNORE INTO jobs(id,device_id,phone,text,status,created_at) VALUES(?,?,?,?,'PENDING',?)"
-        ).bind(id, device.id, phone, message, Date.now());
-      }));
+        ).bind(id, device.id, recipient.phone, message, Date.now()));
+        statements.push(env.SMS_DB.prepare(
+          "INSERT OR IGNORE INTO phone_fallbacks(job_id,message_id,sms_sender,created_at) VALUES(?,?,?,?)"
+        ).bind(id, messageId, recipient.smsSender, Date.now()));
+      }
       await env.SMS_DB.batch(statements);
       if (device.fcm_token) {
         try { await notifyPhone(env, device.fcm_token); }
@@ -1006,7 +1025,8 @@ async function sendSms4FreeRequest({
   recipients,
   sender,
   env,
-  batchNumber
+  batchNumber,
+  timeoutMs = 0
 }) {
 
 
@@ -1015,6 +1035,7 @@ async function sendSms4FreeRequest({
       "https://api.sms4free.co.il/ApiSMS/v2/SendSMS",
       {
         method: "POST",
+        ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
 
 
         headers: {
@@ -1766,6 +1787,163 @@ function smsMonitorAuth(request, env) {
 }
 
 
+
+/* =========================================================
+   PHONE -> SMS4FREE FALLBACK (NEW JOBS ONLY)
+   Each job is locked before invoking the provider. If the phone had already
+   claimed a job, its modem result is uncertain and a duplicate is possible;
+   availability is intentionally preferred over absolute deduplication.
+========================================================= */
+const PHONE_PENDING_WAIT_MS = 90 * 1000;
+const PHONE_IN_FLIGHT_WAIT_MS = 3 * 60 * 1000;
+const FALLBACK_LEASE_MS = 2 * 60 * 1000;
+
+async function processPhoneFallbacks(env) {
+  const db = env.SMS_DB;
+  const now = Date.now();
+  let candidates;
+  try {
+    const result = await db.prepare(`
+      SELECT j.id, j.phone, j.text, j.status, j.created_at, j.claimed_at,
+             f.message_id, f.sms_sender
+      FROM phone_fallbacks f JOIN jobs j ON j.id = f.job_id
+      WHERE f.state IN ('WAITING', 'RETRY', 'SENDING')
+        AND f.next_retry_at <= ?
+        AND (f.state != 'SENDING' OR f.lease_until <= ?)
+        AND j.status != 'MODEM_ACCEPTED'
+        AND (
+          j.status IN ('UNKNOWN', 'FAILED_UNCERTAIN')
+          OR (j.status='PENDING' AND j.created_at <= ?)
+          OR (j.status IN ('CLAIMED','DISPATCHED')
+              AND COALESCE(j.claimed_at,j.created_at) <= ?)
+        )
+      ORDER BY j.created_at ASC LIMIT 25
+    `).bind(now, now, now - PHONE_PENDING_WAIT_MS,
+      now - PHONE_IN_FLIGHT_WAIT_MS).all();
+    candidates = result.results || [];
+  } catch (error) {
+    console.error('PHONE FALLBACK SCAN FAILED:', String(error));
+    throw error;
+  }
+
+  for (let i = 0; i < candidates.length; i += 5) {
+    await Promise.all(candidates.slice(i, i + 5).map(job =>
+      processOnePhoneFallback(env, job).catch(error =>
+        console.error('PHONE FALLBACK JOB FAILED:', job.id, String(error))
+      )
+    ));
+  }
+  // Also refresh dashboard state for messages that completed entirely on the SIM.
+  try { await refreshPhoneQueueStatuses(env); }
+  catch (error) { console.error('PHONE DASHBOARD REFRESH FAILED:', String(error)); }
+}
+
+async function processOnePhoneFallback(env, job) {
+  const db = env.SMS_DB;
+  const now = Date.now();
+
+  // Take the job away from the phone before SMS4FREE begins. This prevents a
+  // still-PENDING phone task from being claimed while the fallback is in flight.
+  if (job.status === 'PENDING') {
+    const changed = await db.prepare(`
+      UPDATE jobs SET status='UNKNOWN',completed_at=?
+      WHERE id=? AND status='PENDING' AND created_at<=?
+    `).bind(now, job.id, now - PHONE_PENDING_WAIT_MS).run();
+    if (changed.meta.changes !== 1) return;
+  } else if (job.status === 'CLAIMED' || job.status === 'DISPATCHED') {
+    const changed = await db.prepare(`
+      UPDATE jobs SET status='UNKNOWN',completed_at=?
+      WHERE id=? AND status=? AND COALESCE(claimed_at,created_at)<=?
+    `).bind(now, job.id, job.status,
+      now - PHONE_IN_FLIGHT_WAIT_MS).run();
+    if (changed.meta.changes !== 1) return;
+  }
+
+  // Atomic lease: only one cron execution may initiate provider fallback.
+  const lease = await db.prepare(`
+    UPDATE phone_fallbacks
+    SET state='SENDING',lease_until=?,attempts=attempts+1
+    WHERE job_id=? AND next_retry_at<=?
+      AND (state IN ('WAITING','RETRY') OR (state='SENDING' AND lease_until<=?))
+  `).bind(Date.now() + FALLBACK_LEASE_MS, job.id, Date.now(), Date.now()).run();
+  if (lease.meta.changes !== 1) return;
+
+  try {
+    const latest = await db.prepare('SELECT status FROM jobs WHERE id=?')
+      .bind(job.id).first();
+    if (latest?.status === 'MODEM_ACCEPTED') {
+      await db.prepare("UPDATE phone_fallbacks SET state='SKIPPED',lease_until=0 WHERE job_id=?")
+        .bind(job.id).run();
+      return;
+    }
+    await sendSms4FreeRequest({
+      message: job.text,
+      recipients: [job.phone],
+      sender: job.sms_sender,
+      env,
+      batchNumber: 1,
+      timeoutMs: 15000
+    });
+    await db.prepare(`
+      UPDATE phone_fallbacks SET state='SENT',sent_at=?,lease_until=0,
+        next_retry_at=0,last_error='' WHERE job_id=?
+    `).bind(Date.now(), job.id).run();
+    console.log('PHONE FALLBACK SENT TO PROVIDER:',
+      JSON.stringify({jobId:job.id,messageId:job.message_id}));
+  } catch (error) {
+    // Retry even after an ambiguous provider timeout. A duplicate may happen
+    // if the provider accepted a request but the acknowledgement was lost.
+    const row = await db.prepare('SELECT attempts FROM phone_fallbacks WHERE job_id=?')
+      .bind(job.id).first();
+    const retryMs = Math.min(15, 2 ** Math.min(4, Number(row?.attempts || 1) - 1)) * 60000;
+    await db.prepare(`
+      UPDATE phone_fallbacks SET state='RETRY',lease_until=0,
+        next_retry_at=?,last_error=? WHERE job_id=?
+    `).bind(Date.now() + retryMs, String(error).slice(0,300), job.id).run();
+    console.error('PHONE FALLBACK RETRY SCHEDULED:', job.id, String(error));
+  }
+}
+
+async function refreshPhoneQueueStatuses(env) {
+  const db = env.SMS_DB;
+  const rows = (await db.prepare(`
+    SELECT f.message_id,
+       COUNT(*) AS total,
+       SUM(CASE WHEN f.state='SENT' THEN 1 ELSE 0 END) AS provider_count,
+       SUM(CASE WHEN j.status='MODEM_ACCEPTED' AND f.state!='SENT' THEN 1 ELSE 0 END) AS phone_count,
+       SUM(CASE WHEN f.state='RETRY' OR f.state='SENDING' THEN 1 ELSE 0 END) AS retry_count,
+       SUM(CASE WHEN f.state='SENT' THEN
+         CASE WHEN length(j.text)<=134 THEN 1
+              ELSE 1+CAST((length(j.text)-134+66)/67 AS INTEGER) END
+         ELSE 0 END) AS provider_units
+    FROM phone_fallbacks f JOIN jobs j ON j.id=f.job_id
+    JOIN sms_messages m ON m.message_id=f.message_id
+    WHERE m.status IN ('QUEUED','PARTIAL','RETRYING')
+      AND f.created_at >= ?
+    GROUP BY f.message_id
+    ORDER BY MAX(f.created_at) DESC LIMIT 60
+  `).bind(Date.now() - 48 * 60 * 60 * 1000).all()).results || [];
+  for (const row of rows) {
+    const total = Number(row.total || 0);
+    const provider = Number(row.provider_count || 0);
+    const phone = Number(row.phone_count || 0);
+    const completed = provider + phone;
+    const done = total > 0 && completed === total;
+    const route = done
+      ? (provider && phone ? 'MIXED' : provider ? 'SMS4FREE' : 'PHONE')
+      : 'PHONE';
+    const status = done ? 'SENT' : Number(row.retry_count) > 0 ? 'RETRYING'
+      : completed > 0 ? 'PARTIAL' : 'QUEUED';
+    const units = Number(row.provider_units || 0);
+    await db.prepare(`
+      UPDATE sms_messages SET route=?,status=?,billable_units=?,estimated_cost_ils=?
+      WHERE message_id=?
+    `).bind(route,status,units,
+      Number((units * Number(env.SMS_UNIT_PRICE_ILS || '0.041')).toFixed(4)),
+      row.message_id).run();
+  }
+}
+
 async function smsMonitorRoute(request, env) {
   if (!smsMonitorAuth(request, env)) return smsMonitorUnauthorized();
   if (!env.SMS_DB) return new Response('Missing SMS_DB binding', {status:503});
@@ -1778,9 +1956,9 @@ async function smsMonitorRoute(request, env) {
   const args = [];
   if (/^\d{4}-\d{2}-\d{2}$/.test(dateFrom)) {filters.push('created_at >= ?');args.push(dateFrom+'T00:00:00Z');}
   if (/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) {filters.push('created_at < ?'); const d = new Date(dateTo+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+1); args.push(d.toISOString());}
-  if (['SMS4FREE','PHONE'].includes(route)) {filters.push('route = ?');args.push(route);}
+  if (['SMS4FREE','PHONE','MIXED'].includes(route)) {filters.push('route = ?');args.push(route);}
   const where = filters.length ? 'WHERE '+filters.join(' AND ') : '';
-  const summary = await env.SMS_DB.prepare(`SELECT COUNT(*) AS messages, COALESCE(SUM(recipient_count),0) AS recipients, COALESCE(SUM(billable_units),0) AS units, COALESCE(SUM(estimated_cost_ils),0) AS cost, SUM(CASE WHEN route='PHONE' THEN 1 ELSE 0 END) AS phone_messages, SUM(CASE WHEN route='SMS4FREE' THEN 1 ELSE 0 END) AS provider_messages FROM sms_messages ${where}`).bind(...args).first();
+  const summary = await env.SMS_DB.prepare(`SELECT COUNT(*) AS messages, COALESCE(SUM(recipient_count),0) AS recipients, COALESCE(SUM(billable_units),0) AS units, COALESCE(SUM(estimated_cost_ils),0) AS cost, SUM(CASE WHEN route IN ('PHONE','MIXED') THEN 1 ELSE 0 END) AS phone_messages, SUM(CASE WHEN route IN ('SMS4FREE','MIXED') THEN 1 ELSE 0 END) AS provider_messages FROM sms_messages ${where}`).bind(...args).first();
   const rows = (await env.SMS_DB.prepare(`SELECT created_at,message_id,whatsapp_sender,group_id,message_text,char_count,recipient_count,segments_per_recipient,billable_units,route,status,estimated_cost_ils,error FROM sms_messages ${where} ORDER BY created_at DESC LIMIT 50 OFFSET ?`).bind(...args,(page-1)*50).all()).results || [];
   const p = new URLSearchParams(url.searchParams);
   if (url.pathname === '/admin/sms/export.csv') {
@@ -1796,6 +1974,6 @@ async function smsMonitorRoute(request, env) {
   const linkPage = n => {p.set('page',String(n));return '/admin/sms?'+p.toString();};
   const table = rows.map(row=>`<tr><td>${smsEsc(new Date(row.created_at).toLocaleString('he-IL',{timeZone:'Asia/Jerusalem'}))}<div class="muted">${smsEsc(new Intl.DateTimeFormat('he-IL-u-ca-hebrew',{day:'numeric',month:'long',year:'numeric',timeZone:'Asia/Jerusalem'}).format(new Date(row.created_at)))}</div></td><td><span title="${smsEsc(row.message_id)}">${smsEsc(row.whatsapp_sender)}</span></td><td class="msg">${smsEsc(row.message_text)}</td><td>${number(row.char_count)}</td><td>${number(row.recipient_count)}</td><td>${number(row.billable_units)}</td><td>${smsEsc(row.route)}</td><td>${smsEsc(row.status)}</td><td>₪${money(row.estimated_cost_ils)}</td></tr>`).join('');
   const downloadParams = new URLSearchParams(url.searchParams); downloadParams.delete('page');
-  const html = `<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>מעקב SMS</title><style>body{font-family:system-ui,Arial;background:#f6f8fb;color:#142139;margin:0;padding:24px}main{max-width:1380px;margin:auto}h1{margin:0 0 8px}.muted{color:#607087}section{background:white;border:1px solid #dfe5ed;border-radius:14px;padding:18px;margin:18px 0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.card{background:#f6f9fc;padding:17px;border-radius:12px}.card b{font-size:26px;display:block;margin-top:8px}.filters{display:flex;flex-wrap:wrap;gap:12px;align-items:end}label{font-weight:600;font-size:13px}input,select{padding:9px;border:1px solid #ccd5e0;border-radius:7px;display:block;margin-top:5px}button,.button{background:#1459a4;color:white;padding:10px 15px;border-radius:8px;border:0;text-decoration:none;display:inline-block;cursor:pointer}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:right;padding:11px;border-bottom:1px solid #edf1f4;vertical-align:top}th{white-space:nowrap;background:#f6f8fb}.scroll{overflow:auto}.msg{min-width:260px;max-width:440px;white-space:pre-wrap;overflow-wrap:anywhere}.footer{display:flex;gap:15px;align-items:center}a{color:#1459a4}</style></head><body><main><h1>מעקב הודעות SMS</h1><p class="muted">נתוני שליחה שנרשמו מאז הפעלת המעקב. עלות משוערת לפי ${smsEsc(env.SMS_UNIT_PRICE_ILS || '0.041')} ₪ ליחידת חיוב, כולל מע״מ. תאריכים מוצגים בשעון ישראל; סינון לפי יום UTC.</p><section><form class="filters" method="get"><label>מתאריך<input type="date" name="from" value="${smsEsc(dateFrom)}"></label><label>עד תאריך<input type="date" name="to" value="${smsEsc(dateTo)}"></label><label>מסלול<select name="route"><option value="">הכול</option><option value="SMS4FREE" ${route==='SMS4FREE'?'selected':''}>SMS4FREE</option><option value="PHONE" ${route==='PHONE'?'selected':''}>טלפון אישי</option></select></label><button>סנן</button><a class="button" href="/admin/sms/export.csv?${smsEsc(downloadParams.toString())}">ייצוא CSV</a></form></section><div class="cards"><div class="card">הודעות מקור<b>${number(summary?.messages)}</b></div><div class="card">נמענים (שליחות)<b>${number(summary?.recipients)}</b></div><div class="card">יחידות לחיוב<b>${number(summary?.units)}</b></div><div class="card">עלות משוערת<b>₪${money(summary?.cost)}</b></div><div class="card">נשלחו ב־SMS4FREE<b>${number(summary?.provider_messages)}</b></div><div class="card">נשלחו בטלפון אישי<b>${number(summary?.phone_messages)}</b></div></div><section class="scroll"><table><thead><tr><th>תאריך ושעה</th><th>שולח</th><th>תוכן ההודעה</th><th>תווים</th><th>נמענים</th><th>יחידות</th><th>מסלול</th><th>מצב</th><th>עלות משוערת</th></tr></thead><tbody>${table||'<tr><td colspan="9">אין הודעות בטווח הנבחר.</td></tr>'}</tbody></table></section><div class="footer">עמוד ${page} מתוך ${Math.max(1,Math.ceil(total/50))} ${page>1?`<a href="${smsEsc(linkPage(page-1))}">הקודם</a>`:''} ${page*50<total?`<a href="${smsEsc(linkPage(page+1))}">הבא</a>`:''}</div><p class="muted">אבטחה: העמוד מוגן בסיסמה; מומלץ להגביל גם באמצעות Cloudflare Access. לא נרשמות כאן הודעות היסטוריות.</p></main></body></html>`;
+  const html = `<!doctype html><html lang="he" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>מעקב SMS</title><style>body{font-family:system-ui,Arial;background:#f6f8fb;color:#142139;margin:0;padding:24px}main{max-width:1380px;margin:auto}h1{margin:0 0 8px}.muted{color:#607087}section{background:white;border:1px solid #dfe5ed;border-radius:14px;padding:18px;margin:18px 0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.card{background:#f6f9fc;padding:17px;border-radius:12px}.card b{font-size:26px;display:block;margin-top:8px}.filters{display:flex;flex-wrap:wrap;gap:12px;align-items:end}label{font-weight:600;font-size:13px}input,select{padding:9px;border:1px solid #ccd5e0;border-radius:7px;display:block;margin-top:5px}button,.button{background:#1459a4;color:white;padding:10px 15px;border-radius:8px;border:0;text-decoration:none;display:inline-block;cursor:pointer}table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:right;padding:11px;border-bottom:1px solid #edf1f4;vertical-align:top}th{white-space:nowrap;background:#f6f8fb}.scroll{overflow:auto}.msg{min-width:260px;max-width:440px;white-space:pre-wrap;overflow-wrap:anywhere}.footer{display:flex;gap:15px;align-items:center}a{color:#1459a4}</style></head><body><main><h1>מעקב הודעות SMS</h1><p class="muted">נתוני שליחה שנרשמו מאז הפעלת המעקב. עלות משוערת לפי ${smsEsc(env.SMS_UNIT_PRICE_ILS || '0.041')} ₪ ליחידת חיוב, כולל מע״מ. תאריכים מוצגים בשעון ישראל; סינון לפי יום UTC.</p><section><form class="filters" method="get"><label>מתאריך<input type="date" name="from" value="${smsEsc(dateFrom)}"></label><label>עד תאריך<input type="date" name="to" value="${smsEsc(dateTo)}"></label><label>מסלול<select name="route"><option value="">הכול</option><option value="SMS4FREE" ${route==='SMS4FREE'?'selected':''}>SMS4FREE</option><option value="PHONE" ${route==='PHONE'?'selected':''}>טלפון אישי</option><option value="MIXED" ${route==='MIXED'?'selected':''}>טלפון + SMS4FREE</option></select></label><button>סנן</button><a class="button" href="/admin/sms/export.csv?${smsEsc(downloadParams.toString())}">ייצוא CSV</a></form></section><div class="cards"><div class="card">הודעות מקור<b>${number(summary?.messages)}</b></div><div class="card">נמענים (שליחות)<b>${number(summary?.recipients)}</b></div><div class="card">יחידות לחיוב<b>${number(summary?.units)}</b></div><div class="card">עלות משוערת<b>₪${money(summary?.cost)}</b></div><div class="card">נשלחו ב־SMS4FREE<b>${number(summary?.provider_messages)}</b></div><div class="card">נשלחו בטלפון אישי<b>${number(summary?.phone_messages)}</b></div></div><section class="scroll"><table><thead><tr><th>תאריך ושעה</th><th>שולח</th><th>תוכן ההודעה</th><th>תווים</th><th>נמענים</th><th>יחידות</th><th>מסלול</th><th>מצב</th><th>עלות משוערת</th></tr></thead><tbody>${table||'<tr><td colspan="9">אין הודעות בטווח הנבחר.</td></tr>'}</tbody></table></section><div class="footer">עמוד ${page} מתוך ${Math.max(1,Math.ceil(total/50))} ${page>1?`<a href="${smsEsc(linkPage(page-1))}">הקודם</a>`:''} ${page*50<total?`<a href="${smsEsc(linkPage(page+1))}">הבא</a>`:''}</div><p class="muted">אבטחה: העמוד מוגן בסיסמה; מומלץ להגביל גם באמצעות Cloudflare Access. לא נרשמות כאן הודעות היסטוריות.</p></main></body></html>`;
   return new Response(html,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Content-Security-Policy':"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"}});
 }
