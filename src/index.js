@@ -42,10 +42,14 @@ export default {
       if (
         request.method === "GET" &&
         url.pathname === "/test-recipients"
-      ) {
-        const groupId =
-          url.searchParams.get("groupId") || "";
+        
+        ) {
+      if (!smsMonitorAuth(request, env)) {
+        return smsMonitorUnauthorized();
+      }
 
+  const groupId =
+    url.searchParams.get("groupId") || "";
 
         const recipients =
           await getSmsRecipients(env, groupId);
